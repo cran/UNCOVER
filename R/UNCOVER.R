@@ -37,7 +37,7 @@
 ##' @param stop_criterion What is the maximum number of clusters allowed before
 ##' we terminate the first stage and begin deforestation. Defaults to 5.
 ##' @param deforest_criterion Constraint type which the final model must satisfy.
-##' Can be one of `"NoC"`, `"SoC"`, `"MaxReg"`, `"Validation"`, `"Balanced"` or
+##' Can be one of `"NoC"`, `"SoC"`, `"MaxReg"`, `"Validation"`, `"Diverse"` or
 ##' `"None"`. See details. Defaults to `"None"`.
 ##' @param prior_mean Mean for the multivariate normal prior used in the SMC
 ##' sampler. See details. Defaults to the origin.
@@ -102,7 +102,7 @@
 ##' validation data for the deforestation stage. Edges are reintroduced if they
 ##' lead to improved prediction of the validation data using the training data
 ##' model (i.e. we aim to maximise a robustness statistic).
-##' \item `"Balanced"`: Balanced Response Class Within Clusters - We specify a
+##' \item `"Diverse"`: Diverse Response Class Within Clusters - We specify a
 ##' minimum number of observations (`options$n_min_class`) in a cluster that
 ##' have the minority response class associated to them (the minimum response
 ##' class is determined for each cluster).
@@ -130,7 +130,7 @@
 ##' data and one for all of the data). `"NoC"` will also track the number of
 ##' clusters, `"SoC"` will track the minimum cluster size and the number of
 ##' criterion breaking clusters, `"Validation"` will track the robustness
-##' statistic and "`Balanced"` will track the minimum minority class across all
+##' statistic and "`Diverse"` will track the minimum minority class across all
 ##' clusters alongside the number of criterion breaking clusters.
 ##'
 ##' @seealso [UNCOVER.opts()], [print.UNCOVER()], [predict.UNCOVER()], [plot.UNCOVER()]
@@ -158,7 +158,7 @@
 ##' UN.validation <- UNCOVER(X = CM,y = rv, deforest_criterion = "Validation",
 ##'                          options = UNCOVER.opts(train_frac = 0.8),
 ##'                          verbose = FALSE)
-##' UN.balanced <- UNCOVER(X = CM,y = rv, deforest_criterion = "Balanced",
+##' UN.diverse <- UNCOVER(X = CM,y = rv, deforest_criterion = "Diverse",
 ##'                        options = UNCOVER.opts(n_min_class = 2),
 ##'                        verbose = FALSE)
 ##' clu_al_mat <- rbind(UN.none$Model$Cluster_Allocation,
@@ -166,7 +166,7 @@
 ##'                     UN.soc$Model$Cluster_Allocation,
 ##'                     UN.maxreg$Model$Cluster_Allocation,
 ##'                     UN.validation$Model$All_Data$Cluster_Allocation,
-##'                     UN.balanced$Model$Cluster_Allocation)
+##'                     UN.diverse$Model$Cluster_Allocation)
 ##' # We can create a matrix where each entry shows in how many of the methods
 ##' # did the indexed observations belong to the same cluster
 ##' obs_con_mat <- matrix(0,100,100)
@@ -185,7 +185,7 @@
 ##'   sum(UN.soc$Model$Log_Marginal_Likelihoods),
 ##'   sum(UN.maxreg$Model$Log_Marginal_Likelihoods),
 ##'   sum(UN.validation$Model$All_Data$Log_Marginal_Likelihoods),
-##'   sum(UN.balanced$Model$Log_Marginal_Likelihoods))
+##'   sum(UN.diverse$Model$Log_Marginal_Likelihoods))
 ##'
 ##' # If we don't assume the prior for the regression coefficients is a
 ##' # standard multivariate normal but instead a multivariate normal with
@@ -242,7 +242,7 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
   IBIS.Z <- memoise::memoise(IBIS.Z,cache = options$SMC_cache,
                               omit_args = c("sampl","current_set"))
   X_names <- colnames(X)
-  X <- as.matrix(X)
+  X <- model.matrix(~.,data = as.data.frame(X))[,-1]
   if(options$prior.override){
     MoreArgs <- options$MoreArgs
     TotArgs <- list(options$N)
@@ -264,8 +264,8 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
       stop("dprior specified does not produce a vector of densities for the
            N samples provided")
     }
-    prior_mean = "overriden"
-    prior_var = "overriden"
+    prior_mean = "overridden"
+    prior_var = "overridden"
   } else{
     rprior <- mvnfast::rmvn
     dprior <- mvnfast::dmvn
@@ -282,12 +282,15 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
     g_val <- two.stage.mst(obs_mat = X,tr_ind = samp,mst_sub = mst_var)
     g <- g_val[[1]]
     g_all <- g_val[[2]]
+    beid <- g_val[[3]]
     X_all <- X
     y_all <- y
     X <- X[samp,,drop=FALSE]
     y <- y[samp]
   } else{
-    g <- one.stage.mst(obs = X,rho = mst_var)
+    osm <- one.stage.mst(obs = X,rho = mst_var)
+    g <- osm[[1]]
+    beid <- osm[[2]]
   }
   depth_g <- igraph::V(g)$name[igraph::dfs(g,igraph::get_diameter(g)[1])$order]
   edge_rank <- matrix(0,length(igraph::E(g)),2)
@@ -304,7 +307,8 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
                   p_num = options$N,rpri = rprior,p_pdf = dprior,MA = MoreArgs,
                   efs = options$ess,nm = options$n_move,
                   cache_bic = options$BIC_cache,cache_smc = options$SMC_cache,
-                  SMC_fun = IBIS.Z,BIC_fun = memo.bic)
+                  SMC_fun = IBIS.Z,BIC_fun = memo.bic,
+                  ribis_thres = options$RIBIS_thres)
   if(options$diagnostics){
     n_min_size <- sum(table(z)<options$min_size)
     num_min_cla <- sum(table(y)<options$n_min_class)
@@ -312,12 +316,12 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
                         Number_Of_Clusters = K,Minimum_Cluster_Size = n,
                         Number_Of_Small_Clusters = n_min_size,
                         Minimum_Minority_Class = min(table(y)),
-                        Number_Of_Unbalanced_Clusters = num_min_cla)
+                        Number_Of_Undiverse_Clusters = num_min_cla)
   }
   edge_rem <- c()
   system_save <- vector(mode = "list",length=1)
   combine_save <- list()
-  if(deforest_criterion=="NoC" | deforest_criterion=="SoC" | deforest_criterion=="Balanced"){
+  if(deforest_criterion=="NoC" | deforest_criterion=="SoC" | deforest_criterion=="Diverse"){
     model_selection <- list(z,logZ,g,K,edge_rem)
   }
   m <- 1
@@ -347,7 +351,7 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
           }
           next
         }
-        if(z[igraph::get.edgelist(g,names=FALSE)[i,]][1]!=k){
+        if(z[igraph::get.edgelist(g,names=FALSE)[i,]][1]!=k | E(g)[igraph::get.edge.ids(g,igraph::get.edgelist(g)[i,])]$weight<beid){
           if(verbose){
             utils::txtProgressBar(min=1,max=nrow(edge_rank),initial=q,style=3)
           }
@@ -371,7 +375,8 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
                                pdf_fun = dprior,efsamp = options$ess,
                                methas = options$n_move,cb = options$BIC_cache,
                                cs = options$SMC_cache,PA = MoreArgs,
-                               SMC_f = IBIS.Z,BIC_f = memo.bic)
+                               SMC_f = IBIS.Z,BIC_f = memo.bic,
+                               rt = options$RIBIS_thres)
         if(sum(er_temp[[2]])>sum(system_save[[k]][[2]])){
           if(deforest_criterion=="Validation"){
             system_save[[k]] <- c(er_temp,list(igraph::get.edgelist(g)[i,]),
@@ -407,11 +412,11 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
     }
     if(options$diagnostics){
       tab_z <- table(z)
-      sap_bal <- sapply(1:(K+1),FUN = function(u,res,clu_al){min(table(factor(res[which(clu_al==u)],levels=0:1)))},res=y,clu_al=z)
+      sap_div <- sapply(1:(K+1),FUN = function(u,res,clu_al){min(table(factor(res[which(clu_al==u)],levels=0:1)))},res=y,clu_al=z)
       Track <- rbind(Track,
                      c(paste0("Rem.",system_save[[k_change]][[4]][1],"-",system_save[[k_change]][[4]][2]),
                        sum(logZ),K+1,min(tab_z),sum(tab_z<options$min_size),
-                       min(sap_bal),sum(sap_bal<options$n_min_class)))
+                       min(sap_div),sum(sap_div<options$n_min_class)))
     }
     for(k in 1:K){
       if(k==k_change){
@@ -441,9 +446,9 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
         model_selection <- list(z,logZ,g,K,edge_rem)
       }
     }
-    if(deforest_criterion=="Balanced"){
-      unbal_clu <- sapply(1:K,FUN = function(u,res,clu_al,ups){all(table(factor(res[which(clu_al==u)],levels=0:1))>=ups)},res=y,clu_al=z,ups=options$n_min_class)
-      if(all(unbal_clu) & sum(logZ)>sum(model_selection[[2]])){
+    if(deforest_criterion=="Diverse"){
+      undiv_clu <- sapply(1:K,FUN = function(u,res,clu_al,ups){all(table(factor(res[which(clu_al==u)],levels=0:1))>=ups)},res=y,clu_al=z,ups=options$n_min_class)
+      if(all(undiv_clu) & sum(logZ)>sum(model_selection[[2]])){
         model_selection <- list(z,logZ,g,K,edge_rem)
       }
     }
@@ -467,7 +472,8 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
                                           cache_bic = options$BIC_cache,
                                           cache_smc = options$SMC_cache,
                                           MA = MoreArgs,SMC_fun = IBIS.Z,
-                                          BIC_fun = memo.bic))
+                                          BIC_fun = memo.bic,
+                                          ribis_thres = options$RIBIS_thres))
       }
       if(verbose){
         utils::txtProgressBar(min=1,max=nrow(edge_rem)+1,initial=j+1,style=3)
@@ -499,7 +505,7 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
             system_save[[k]][[2]][edge_z[1]] <- combine_save[[cut_comb]][[2]]
             system_save[[k]][[2]] <- system_save[[k]][[2]][-edge_z[2]]
             system_save[[k]][[3]] <- igraph::add_edges(system_save[[k]][[3]],
-                                               edge_rem[cut_comb,])
+                                               edge_rem[cut_comb,],weight = beid)
             if(deforest_criterion=="Validation"){
               system_save[[k]][[5]] <- igraph::add_edges(system_save[[k]][[5]],
                                                  edge_rem[cut_comb,])
@@ -507,16 +513,16 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
           }
           logZ[edge_z[1]] <- combine_save[[cut_comb]][[2]]
           logZ <- logZ[-edge_z[2]]
-          g <- igraph::add_edges(g,edge_rem[cut_comb,])
+          g <- igraph::add_edges(g,edge_rem[cut_comb,],weight = beid)
           if(deforest_criterion=="Validation"){
             g_all <- igraph::add_edges(g_all,edge_rem[cut_comb,])
           }
           if(options$diagnostics){
             tab_z <- table(z)
-            sap_bal <- sapply(1:(K-1),FUN = function(u,res,clu_al){min(table(factor(res[which(clu_al==u)],levels=0:1)))},res=y,clu_al=z)
+            sap_div <- sapply(1:(K-1),FUN = function(u,res,clu_al){min(table(factor(res[which(clu_al==u)],levels=0:1)))},res=y,clu_al=z)
             Track <- rbind(Track,c(paste0("Add.",edge_rem[cut_comb,1],"-",edge_rem[cut_comb,2]),
                                    sum(logZ),K-1,min(tab_z),sum(tab_z<options$min_size),
-                                   min(sap_bal),sum(sap_bal<options$n_min_class)))
+                                   min(sap_div),sum(sap_div<options$n_min_class)))
           }
           edge_rem <- edge_rem[-cut_comb,,drop=FALSE]
           combine_save[[cut_comb]] <- c()
@@ -536,9 +542,9 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
               model_selection <- list(z,logZ,g,K,edge_rem)
             }
           }
-          if(deforest_criterion=="Balanced"){
-            unbal_clu <- sapply(1:K,FUN = function(u,res,clu_al,ups){all(table(factor(res[which(clu_al==u)],levels=0:1))>=ups)},res=y,clu_al=z,ups=options$n_min_class)
-            if(all(unbal_clu) & sum(logZ)>sum(model_selection[[2]])){
+          if(deforest_criterion=="Diverse"){
+            undiv_clu <- sapply(1:K,FUN = function(u,res,clu_al,ups){all(table(factor(res[which(clu_al==u)],levels=0:1))>=ups)},res=y,clu_al=z,ups=options$n_min_class)
+            if(all(undiv_clu) & sum(logZ)>sum(model_selection[[2]])){
               model_selection <- list(z,logZ,g,K,edge_rem)
             }
           }
@@ -556,20 +562,39 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
     message("Deforestation Stage")
   }
   if(deforest_criterion=="NoC"){
-    if(!options$diagnostics){
-      Z_track = NULL
-      K_track = NULL
+    if(K==1){
+      if(options$diagnostics){
+        pnoc <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem,
+                    Diagnostics = Track[,1:3])
+      } else{
+        pnoc <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem)
+      }
+    } else{
+      if(options$diagnostics){
+        Tr_in <- Track[,1:3]
+      } else{
+        Tr_in <- NULL
+      }
+      pnoc <- deforest.noc(obs = X,res = y,gra = g,lbe = logZ,eps = edge_rem,
+                           K_dag = options$max_K,clu_al = z,c_s = combine_save,
+                           est_thres = options$SMC_thres,
+                           mtb = options$BIC_memo_thres,
+                           mts = options$SMC_memo_thres,par_no = options$N,
+                           rfun = rprior,pdf_fun = dprior,efsamp = options$ess,
+                           methas = options$n_move,vb = verbose,
+                           cb = options$BIC_cache,cs = options$SMC_cache,
+                           PA = MoreArgs,diagnostics = options$diagnostics,
+                           Tr = Tr_in,SMC_f = IBIS.Z,BIC_f = memo.bic,
+                           rt = options$RIBIS_thres)
     }
-    pnoc <- deforest.noc(obs = X,res = y,gra = g,lbe = logZ,eps = edge_rem,
-                         K_dag = options$max_K,clu_al = z,c_s = combine_save,
-                         est_thres = options$SMC_thres,
-                         mtb = options$BIC_memo_thres,
-                         mts = options$SMC_memo_thres,par_no = options$N,
-                         rfun = rprior,pdf_fun = dprior,efsamp = options$ess,
-                         methas = options$n_move,vb = verbose,
-                         cb = options$BIC_cache,cs = options$SMC_cache,
-                         PA = MoreArgs,diagnostics = options$diagnostics,
-                         Tr = Track[,1:3],SMC_f = IBIS.Z,BIC_f = memo.bic)
     memoise::forget(memo.bic)
     memoise::forget(IBIS.Z)
     if(sum(model_selection[[2]])>sum(pnoc[[2]])){
@@ -594,17 +619,39 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
     }
   }
   if(deforest_criterion=="SoC"){
-    psoc <- deforest.soc(obs = X,res = y,gra = g,lbe = logZ,eps = edge_rem,
-                         n_dag = options$min_size,clu_al = z,c_s = combine_save,
-                         est_thres = options$SMC_thres,
-                         mtb = options$BIC_memo_thres,
-                         mts = options$SMC_memo_thres,par_no = options$N,
-                         rfun = rprior,pdf_fun = dprior,efsamp = options$ess,
-                         methas = options$n_move,vb = verbose,
-                         cb = options$BIC_cache,cs = options$SMC_cache,
-                         PA = MoreArgs,diagnostics = options$diagnostics,
-                         Tr = Track[,c(1:2,4:5)],SMC_f = IBIS.Z,
-                         BIC_f = memo.bic)
+    if(K==1){
+      if(options$diagnostics){
+        psoc <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem,
+                    Diagnostics = Track[,c(1:2,4:5)])
+      } else{
+        psoc <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem)
+      }
+    } else{
+      if(options$diagnostics){
+        Tr_in <- Track[,c(1:2,4:5)]
+      } else{
+        Tr_in <- NULL
+      }
+      psoc <- deforest.soc(obs = X,res = y,gra = g,lbe = logZ,eps = edge_rem,
+                           n_dag = options$min_size,clu_al = z,c_s = combine_save,
+                           est_thres = options$SMC_thres,
+                           mtb = options$BIC_memo_thres,
+                           mts = options$SMC_memo_thres,par_no = options$N,
+                           rfun = rprior,pdf_fun = dprior,efsamp = options$ess,
+                           methas = options$n_move,vb = verbose,
+                           cb = options$BIC_cache,cs = options$SMC_cache,
+                           PA = MoreArgs,diagnostics = options$diagnostics,
+                           Tr = Tr_in,SMC_f = IBIS.Z,
+                           BIC_f = memo.bic, rt = options$RIBIS_thres)
+    }
     memoise::forget(memo.bic)
     memoise::forget(IBIS.Z)
     if(sum(model_selection[[2]])>sum(psoc[[2]])){
@@ -631,26 +678,48 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
       res <- psoc
     }
   }
-  if(deforest_criterion=="Balanced"){
-    pbal <- deforest.balanced(obs = X,res = y,gra = g,lbe = logZ,eps = edge_rem,
-                              ups = options$n_min_class,clu_al = z,
-                              c_s = combine_save,est_thres = options$SMC_thres,
-                              mtb = options$BIC_memo_thres,
-                              mts = options$SMC_memo_thres,par_no = options$N,
-                              rfun = rprior,pdf_fun = dprior,
-                              efsamp = options$ess,methas = options$n_move,
-                              vb = verbose,cb = options$BIC_cache,
-                              cs = options$SMC_cache,PA = MoreArgs,
-                              diagnostics = options$diagnostics,
-                              Tr = Track[,c(1:2,6:7)],SMC_f = IBIS.Z,
-                              BIC_f = memo.bic)
+  if(deforest_criterion=="Diverse"){
+    if(K==1){
+      if(options$diagnostics){
+        pdiv <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem,
+                    Diagnostics = Track[,c(1:2,6:7)])
+      } else{
+        pdiv <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem)
+      }
+    } else{
+      if(options$diagnostics){
+        Tr_in <- Track[,c(1:2,6:7)]
+      } else{
+        Tr_in <- NULL
+      }
+      pdiv <- deforest.diverse(obs = X,res = y,gra = g,lbe = logZ,eps = edge_rem,
+                                ups = options$n_min_class,clu_al = z,
+                                c_s = combine_save,est_thres = options$SMC_thres,
+                                mtb = options$BIC_memo_thres,
+                                mts = options$SMC_memo_thres,par_no = options$N,
+                                rfun = rprior,pdf_fun = dprior,
+                                efsamp = options$ess,methas = options$n_move,
+                                vb = verbose,cb = options$BIC_cache,
+                                cs = options$SMC_cache,PA = MoreArgs,
+                                diagnostics = options$diagnostics,
+                                Tr = Tr_in,SMC_f = IBIS.Z,
+                                BIC_f = memo.bic, rt = options$RIBIS_thres)
+    }
     memoise::forget(memo.bic)
     memoise::forget(IBIS.Z)
-    if(sum(model_selection[[2]])>sum(pbal[[2]])){
+    if(sum(model_selection[[2]])>sum(pdiv[[2]])){
       if(options$diagnostics){
-        Track <- pbal$Diagnostics
-        sap_bal <- sapply(1:(model_selection[[4]]),FUN = function(u,res,clu_al){min(table(factor(res[which(clu_al==u)],levels=0:1)))},res=y,clu_al=model_selection[[1]])
-        Track <- rbind(Track,c("Rev.",sum(model_selection[[2]]),min(sap_bal),sum(sap_bal<options$n_min_class)))
+        Track <- pdiv$Diagnostics
+        sap_div <- sapply(1:(model_selection[[4]]),FUN = function(u,res,clu_al){min(table(factor(res[which(clu_al==u)],levels=0:1)))},res=y,clu_al=model_selection[[1]])
+        Track <- rbind(Track,c("Rev.",sum(model_selection[[2]]),min(sap_div),sum(sap_div<options$n_min_class)))
         res <- list(Cluster_Allocation = model_selection[[1]],
                     Log_Marginal_Likelihoods = model_selection[[2]],
                     Graph = model_selection[[3]],
@@ -665,7 +734,7 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
                     Edges_Removed = model_selection[[5]])
       }
     } else{
-      res <- pbal
+      res <- pdiv
     }
   }
   if(deforest_criterion=="None"){
@@ -687,36 +756,114 @@ UNCOVER <- function(X,y,mst_var=NULL,options = UNCOVER.opts(),stop_criterion=5,
     }
   }
   if(deforest_criterion=="MaxReg"){
-    pmaxreg <- deforest.maxreg(obs = X,res = y,gra = g,lbe = logZ,
-                               eps = edge_rem, tau = options$reg,clu_al = z,
-                               c_s = combine_save,
-                               est_thres = options$SMC_thres,
-                               mtb = options$BIC_memo_thres,
-                               mts = options$SMC_memo_thres,par_no = options$N,
-                               rfun = rprior,pdf_fun = dprior,
-                               efsamp = options$ess,methas = options$n_move,
-                               vb = verbose,cb = options$BIC_cache,
-                               cs = options$SMC_cache,PA = MoreArgs,
-                               diagnostics = options$diagnostics,
-                               Tr = Track[,1:2],SMC_f = IBIS.Z,BIC_f = memo.bic)
+    if(K==1){
+      if(options$diagnostics){
+        pmaxreg <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem,
+                    Diagnostics = Track[,1:2])
+      } else{
+        pmaxreg <- list(Cluster_Allocation = z,
+                    Log_Marginal_Likelihoods = logZ,
+                    Graph = g,
+                    Number_of_Clusters = K,
+                    Edges_Removed = edge_rem)
+      }
+    } else{
+      if(options$diagnostics){
+        Tr_in <- Track[,1:2]
+      } else{
+        Tr_in <- NULL
+      }
+      pmaxreg <- deforest.maxreg(obs = X,res = y,gra = g,lbe = logZ,
+                                 eps = edge_rem, tau = options$reg,clu_al = z,
+                                 c_s = combine_save,
+                                 est_thres = options$SMC_thres,
+                                 mtb = options$BIC_memo_thres,
+                                 mts = options$SMC_memo_thres,par_no = options$N,
+                                 rfun = rprior,pdf_fun = dprior,
+                                 efsamp = options$ess,methas = options$n_move,
+                                 vb = verbose,cb = options$BIC_cache,
+                                 cs = options$SMC_cache,PA = MoreArgs,
+                                 diagnostics = options$diagnostics,
+                                 Tr = Tr_in,SMC_f = IBIS.Z,BIC_f = memo.bic,
+                                 rt = options$RIBIS_thres)
+    }
     memoise::forget(memo.bic)
     memoise::forget(IBIS.Z)
-    res <- (pmaxreg)
+    res <- pmaxreg
   }
   if(deforest_criterion=="Validation"){
-    pval <- deforest.validation(obs = X,obs_all = X_all,res = y,res_all = y_all,
-                                gra = g,lbe = logZ,eps = edge_rem,gra_all = g_all,
-                                clu_al = z,c_s = combine_save,
-                                est_thres = options$SMC_thres,
-                                mtb = options$BIC_memo_thres,
-                                mts = options$SMC_memo_thres,par_no = options$N,
-                                rfun = rprior,pdf_fun = dprior,
-                                efsamp = options$ess,methas = options$n_move,
-                                rho = mst_var,vb = verbose,
-                                cb = options$BIC_cache,cs = options$SMC_cache,
-                                PA = MoreArgs,diagnostics = options$diagnostics,
-                                Tr = Track[,1:2],SMC_f = IBIS.Z,
-                                BIC_f = memo.bic)
+    if(K==1){
+      if(options$diagnostics){
+        Tr <- data.frame(Track[,1:2],Log_Bayesian_Evidence_All = rep(NA,nrow(Track[,1:2])),
+                           Robustness_Statistic = rep(NA,nrow(Track[,1:2])))
+      }
+      z_all <- igraph::components(g_all)$membership
+      for(k in 1:K){
+        z_all[which(z_all==z_all[as.numeric(igraph::V(g)$name[which(z==k)[1]])])] <- K+k
+      }
+      z_all <- z_all - K
+      logZ_all <- logZ
+      for(k in 1:K){
+        logZ_all[k] <- lbe.gen(thres = options$SMC_thres,obs_mat = X_all,
+                               res_vec = y_all,obs_ind = which(z_all==k),
+                               memo_thres_bic = options$BIC_memo_thres,
+                               memo_thres_smc = options$SMC_memo_thres,
+                               p_num = options$N,rpri = rprior,p_pdf = dprior,
+                               efs = options$ess,nm = options$n_move,
+                               cache_bic = options$BIC_cache,
+                               cache_smc = options$SMC_cache,MA = MoreArgs,
+                               SMC_fun = IBIS.Z,BIC_fun = memo.bic,
+                               ribis_thres = options$RIBIS_thres)
+      }
+      RobS <- sum(logZ_all-logZ)
+      if(options$diagnostics){
+        Tr[nrow(Tr),3:4] <- c(sum(logZ_all),RobS)
+      }
+      TD = list(Cluster_Allocation = z,
+                Log_Marginal_Likelihoods = logZ,
+                Graph = g,
+                Number_of_Clusters = K,
+                Edges_Removed = edge_rem)
+      if(options$diagnostics){
+        AD = list(Cluster_Allocation = z_all,
+                  Log_Marginal_Likelihoods = logZ_all,
+                  Graph = g_all,
+                  Number_of_Clusters = K,
+                  Edges_Removed = edge_rem,
+                  Diagnostics = Tr)
+      } else{
+        AD = list(Cluster_Allocation = z_all,
+                  Log_Marginal_Likelihoods = logZ_all,
+                  Graph = g_all,
+                  Number_of_Clusters = K,
+                  Edges_Removed = edge_rem)
+      }
+      pval <- list(Training_Data = TD,
+                   All_Data = AD)
+    } else{
+      if(options$diagnostics){
+        Tr_in <- Track[,1:2]
+      } else{
+        Tr_in <- NULL
+      }
+      pval <- deforest.validation(obs = X,obs_all = X_all,res = y,res_all = y_all,
+                                  gra = g,lbe = logZ,eps = edge_rem,gra_all = g_all,
+                                  clu_al = z,c_s = combine_save,
+                                  est_thres = options$SMC_thres,
+                                  mtb = options$BIC_memo_thres,
+                                  mts = options$SMC_memo_thres,par_no = options$N,
+                                  rfun = rprior,pdf_fun = dprior,
+                                  efsamp = options$ess,methas = options$n_move,
+                                  rho = mst_var,vb = verbose,
+                                  cb = options$BIC_cache,cs = options$SMC_cache,
+                                  PA = MoreArgs,diagnostics = options$diagnostics,
+                                  Tr = Tr_in,SMC_f = IBIS.Z,
+                                  BIC_f = memo.bic,rt = options$RIBIS_thres)
+    }
     memoise::forget(memo.bic)
     memoise::forget(IBIS.Z)
     res <- pval
@@ -912,7 +1059,7 @@ predict.UNCOVER <- function(object,newX=NULL,type="prob",...){
 ##' \item{`"Validation"`}{A plot tracking the overall log Bayesian evidence
 ##' after every action (for both the training data and all of the data) and a
 ##' plot tracking the robustness statistic after every deforestation action.}
-##' \item{`"Balanced"`}{Three plots; one tracking the overall log Bayesian
+##' \item{`"Diverse"`}{Three plots; one tracking the overall log Bayesian
 ##' evidence after every action, one tracking the number of criterion breaking
 ##' clusters after every action and one tracking the minimum minority class
 ##' across clusters after every action.}
@@ -947,7 +1094,7 @@ predict.UNCOVER <- function(object,newX=NULL,type="prob",...){
 ##' UN.validation <- UNCOVER(X = CM,y = rv, deforest_criterion = "Validation",
 ##'                          options = UNCOVER.opts(train_frac = 0.8),
 ##'                          verbose = FALSE)
-##' UN.balanced <- UNCOVER(X = CM,y = rv, deforest_criterion = "Balanced",
+##' UN.diverse <- UNCOVER(X = CM,y = rv, deforest_criterion = "Diverse",
 ##'                        options = UNCOVER.opts(n_min_class = 2), verbose = FALSE)
 ##' plot(UN.none,type = "covariates")
 ##' plot(UN.none,type = "fitted")
@@ -957,7 +1104,7 @@ predict.UNCOVER <- function(object,newX=NULL,type="prob",...){
 ##' plot(UN.soc,type = "diagnostics",diagnostic_x_axis = "minimal")
 ##' plot(UN.maxreg,type = "diagnostics",diagnostic_x_axis = "minimal")
 ##' plot(UN.validation,type = "diagnostics",diagnostic_x_axis = "minimal")
-##' plot(UN.balanced,type = "diagnostics",diagnostic_x_axis = "minimal")
+##' plot(UN.diverse,type = "diagnostics",diagnostic_x_axis = "minimal")
 ##'
 ##' # If we only wanted to view the second co-variate
 ##' plot(UN.none,type = "covariates",plot_var=2)
@@ -985,18 +1132,19 @@ plot.UNCOVER <- function(x,type = "covariates",
     }
     x$Covariate_Matrix <- x$Covariate_Matrix[,plot_var,drop=FALSE]
     if(ncol(x$Covariate_Matrix)==1){
-      overall_plot <- ggplot2::ggplot(data.frame(x$Covariate_Matrix,y.axis = rep(0,nrow(x$Covariate_Matrix)),
-                                                 y = as.character(x$Response_Vector),
-                                                 Cluster = as.factor(x$Model$Cluster_Allocation))) +
+      plotdf <- data.frame(x$Covariate_Matrix,y.axis = rep(0,nrow(x$Covariate_Matrix)),
+                           y = as.character(x$Response_Vector),
+                           Cluster = as.factor(x$Model$Cluster_Allocation))
+      overall_plot <- ggplot2::ggplot(plotdf) +
         ggplot2::geom_density(show.legend = FALSE,
-                              ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
+                              ggplot2::aes_string(colnames(plotdf)[1],
                                                   colour = "Cluster",
                                                   fill = "Cluster"),alpha = 0.25) +
         ggplot2::geom_point(alpha=0,
-                            ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
+                            ggplot2::aes_string(colnames(plotdf)[1],
                                                 "y.axis",colour = "Cluster")) +
         ggplot2::geom_text(alpha = 1,show.legend = FALSE,size = 3,
-                           ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
+                           ggplot2::aes_string(colnames(plotdf)[1],
                                                "y.axis",
                                                label = "y",colour = "Cluster")) +
         ggplot2::guides(colour = ggplot2::guide_legend(override.aes = list(alpha=1),
@@ -1004,11 +1152,12 @@ plot.UNCOVER <- function(x,type = "covariates",
         ggplot2::labs(y = "density") +
         ggplot2::theme(legend.position = "bottom")
     } else{
-      legend_plot <- ggplot2::ggplot(data.frame(x$Covariate_Matrix[,c(1,2)],
-                                                Cluster = as.factor(x$Model$Cluster_Allocation)),
-                                     ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
-                                                  colnames(x$Covariate_Matrix)[2],
-                                                  colour = "Cluster")) +
+      plotdf <- data.frame(x$Covariate_Matrix[,c(1,2)],
+                           Cluster = as.factor(x$Model$Cluster_Allocation))
+      legend_plot <- ggplot2::ggplot(plotdf,
+                                     ggplot2::aes_string(colnames(plotdf)[1],
+                                                         colnames(plotdf)[2],
+                                                         colour = "Cluster")) +
         ggplot2::geom_point() + ggplot2::theme(legend.position = "bottom")
       label_plot <- function(data,mapping,...){
         ggplot2::ggplot(data = data,mapping = mapping) +
@@ -1033,24 +1182,25 @@ plot.UNCOVER <- function(x,type = "covariates",
     X_prob <- predict.UNCOVER(object = x)[,2]
     x$Covariate_Matrix <- x$Covariate_Matrix[,plot_var,drop=FALSE]
     if(ncol(x$Covariate_Matrix)==1){
-      overall_plot <- ggplot2::ggplot(data.frame(x$Covariate_Matrix,
-                                                 y.axis = rep(0,nrow(x$Covariate_Matrix)),
-                                                 y = as.character(x$Response_Vector),
-                                                 Fitted.Probabilities = X_prob,
-                                                 Hard.Assignment = X_prob>=0.5)) +
+      plotdf <- data.frame(x$Covariate_Matrix,
+                           y.axis = rep(0,nrow(x$Covariate_Matrix)),
+                           y = as.character(x$Response_Vector),
+                           Fitted.Probabilities = X_prob,
+                           Hard.Assignment = X_prob>=0.5)
+      overall_plot <- ggplot2::ggplot(plotdf) +
         ggplot2::geom_density(show.legend = FALSE,
-                              ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
+                              ggplot2::aes_string(colnames(plotdf)[1],
                                                   colour = "Hard.Assignment",
                                                   fill = "Hard.Assignment"),alpha=0.25) +
         ggplot2::scale_colour_manual(values = c("red","green")) +
         ggplot2::scale_fill_manual(values = c("red","green")) +
         ggnewscale::new_scale_color() +
         ggplot2::geom_point(alpha=0,
-                            ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
+                            ggplot2::aes_string(colnames(plotdf)[1],
                                                 "y.axis",
                                                 colour = "Fitted.Probabilities")) +
         ggplot2::geom_text(alpha = 1,show.legend = FALSE,size = 3,
-                           ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
+                           ggplot2::aes_string(colnames(plotdf)[1],
                                                "y.axis",
                                                label = "y",
                                                colour = "Fitted.Probabilities")) +
@@ -1058,10 +1208,11 @@ plot.UNCOVER <- function(x,type = "covariates",
         ggplot2::labs(y = "density") +
         ggplot2::theme(legend.position = "bottom")
     } else{
-      legend_plot <- ggplot2::ggplot(data.frame(x$Covariate_Matrix[,c(1,2)],
-                                                Fitted.Probabilities = X_prob),
-                                     ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
-                                         colnames(x$Covariate_Matrix)[2],
+      plotdf <- data.frame(x$Covariate_Matrix[,c(1,2)],
+                           Fitted.Probabilities = X_prob)
+      legend_plot <- ggplot2::ggplot(plotdf,
+                                     ggplot2::aes_string(colnames(plotdf)[1],
+                                         colnames(plotdf)[2],
                                          colour = "Fitted.Probabilities")) +
         ggplot2::geom_point() + ggplot2::theme(legend.position = "bottom") +
         ggplot2::scale_color_gradient(low = "red",high = "green",name = "Fitted Probabilities",limits = c(0,1))
@@ -1102,11 +1253,12 @@ plot.UNCOVER <- function(x,type = "covariates",
     if(x$Deforestation_Criterion=="Validation"){
       x$Model <- x$Model$All_Data
     }
-    legend_plot <- ggplot2::ggplot(data.frame(x$Covariate_Matrix[,c(1,2)],
-                                              Cluster = as.factor(x$Model$Cluster_Allocation)),
-                                   ggplot2::aes_string(colnames(x$Covariate_Matrix)[1],
-                                                colnames(x$Covariate_Matrix)[2],
-                                                colour = "Cluster")) +
+    plotdf <- data.frame(x$Covariate_Matrix[,c(1,2)],
+                         Cluster = as.factor(x$Model$Cluster_Allocation))
+    legend_plot <- ggplot2::ggplot(plotdf,
+                                   ggplot2::aes_string(colnames(plotdf)[1],
+                                                       colnames(plotdf)[2],
+                                                       colour = "Cluster")) +
       ggplot2::geom_point() + ggplot2::theme(legend.position = "bottom")
     overall_plot <- GGally::ggpairs(samp.df,ggplot2::aes_string(alpha = 0.5,
                                                          color = as.factor(rep(1:x$Model$Number_of_Clusters,each = x$Control$N)),
@@ -1263,7 +1415,7 @@ plot.UNCOVER <- function(x,type = "covariates",
                                                        "Log Robustness Statistic"),
                                        legend = 1) + ggplot2::theme(legend.position = "top")
     }
-    if(x$Deforestation_Criterion=="Balanced"){
+    if(x$Deforestation_Criterion=="Diverse"){
       obs_lev <- x$Model$Diagnostics$Action
       obs_lev_tics <- rep("",length(obs_lev))
       obs_lev_tics[c(1,round(length(obs_lev)*(1:4)/4))] <- obs_lev[c(1,round(length(obs_lev)*(1:4)/4))]
@@ -1288,10 +1440,10 @@ plot.UNCOVER <- function(x,type = "covariates",
       if(diagnostic_x_axis=="minimal"){
         plot_2 <- plot_2 + ggplot2::scale_x_discrete(labels = obs_lev_tics)
       }
-      x$Model$Diagnostics$Number_Of_Unbalanced_Clusters <- as.integer(x$Model$Diagnostics$Number_Of_Unbalanced_Clusters)
+      x$Model$Diagnostics$Number_Of_Undiverse_Clusters <- as.integer(x$Model$Diagnostics$Number_Of_Undiverse_Clusters)
       plot_3 <- ggplot2::ggplot(x$Model$Diagnostics,
                                 ggplot2::aes_string(x = "Action",
-                                             y = "Number_Of_Unbalanced_Clusters",group=1)) +
+                                             y = "Number_Of_Undiverse_Clusters",group=1)) +
         ggplot2::geom_point() + ggplot2::geom_line() +
         ggplot2::labs(x = "Action",y = "Number of Criterion Breaking Clusters")
       if(diagnostic_x_axis=="minimal"){
@@ -1328,7 +1480,7 @@ plot.UNCOVER <- function(x,type = "covariates",
 ##' @param n_min_class Each cluster will have an associated minority class.
 ##' `n_min_class` specifies a minimum number of observations that should have
 ##' that class for each and every cluster. Should only be directly specified if
-##' `deforest_criterion == "Balanced`. Defaults to 0.
+##' `deforest_criterion == "Diverse`. Defaults to 0.
 ##' @param SMC_thres The threshold for which the number of observations needs to
 ##' exceed to consider using BIC as an estimator. Defaults to 30 if not
 ##' specified.
@@ -1355,6 +1507,9 @@ plot.UNCOVER <- function(x,type = "covariates",
 ##' default prior form this does not need to be specified.
 ##' @param diagnostics Should diagnostic data be recorded and outputted?
 ##' Defaults to `TRUE`.
+##' @param RIBIS_thres The threshold for which the number of observations needs
+##' to exceed to consider ever using RIBIS as an estimator. Defaults to 30 if
+##' not specified. See details.
 ##' @param BIC_cache The cache for the function which estimates the log Bayesian
 ##' evidence using BIC. Defaults to a cache with standard size and least
 ##' recently used eviction policy.
@@ -1387,6 +1542,7 @@ plot.UNCOVER <- function(x,type = "covariates",
 ##' overridden or not}
 ##' \item{`diagnostics`}{Logical value indicating whether diagnostic information
 ##' should be included in the output of `UNCOVER`}
+##' \item{`RIBIS_thres`}{The threshold for allowing the use of RIBIS}
 ##' \item{`BIC_cache`}{Cache for the memoised function which estimates the log
 ##' Bayesian evidence using BIC}
 ##' \item{`SMC_cache`}{Cache for the memoised function which estimates the log
@@ -1421,6 +1577,10 @@ plot.UNCOVER <- function(x,type = "covariates",
 ##' observations). `SMC_memo_thres` can be much lower as the SMC sampler is a
 ##' much more expensive function to run. See Emerson and Aslett (2023) for more
 ##' details.
+##'
+##' `RIBIS_thres` can be specified to have a higher value to ensure that the
+##' asymptotic properties which Reverse Iterated Batch Importance Sampling
+##' (RIBIS) relies upon hold. See Emerson and Aslett (2023) for more details.
 ##'
 ##' Specifying `rprior` and `dprior` will not override the default prior form
 ##' unless `prior.override=TRUE`. If a multivariate normal form is required then
@@ -1472,6 +1632,7 @@ UNCOVER.opts <- function(N = 1000,train_frac = 1,max_K = Inf,min_size = 0,
                         BIC_memo_thres = Inf,SMC_memo_thres = Inf,ess = N/2,
                         n_move = 1,prior.override = FALSE,rprior = NULL,
                         dprior = NULL,diagnostics = TRUE,
+                        RIBIS_thres = 30,
                         BIC_cache = cachem::cache_mem(max_size = 1024 * 1024^2,
                                                       evict = "lru"),
                         SMC_cache = cachem::cache_mem(max_size = 1024 * 1024^2,
@@ -1528,6 +1689,6 @@ UNCOVER.opts <- function(N = 1000,train_frac = 1,max_K = Inf,min_size = 0,
               BIC_memo_thres = BIC_memo_thres,
               SMC_memo_thres = SMC_memo_thres,ess = ess,n_move = n_move,
               rprior = rprior,dprior = dprior,prior.override = prior.override,
-              diagnostics = diagnostics,
+              diagnostics = diagnostics, RIBIS_thres = RIBIS_thres,
               BIC_cache = BIC_cache,SMC_cache = SMC_cache,MoreArgs = MoreArgs))
 }
